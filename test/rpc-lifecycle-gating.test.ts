@@ -156,9 +156,9 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     expect(reply![1].data.id).toBeTruthy();
   });
 
-  // The steer_subagent tool and an @handle steer both emit subagents:steered;
-  // the bus path goes through the manager, which never emits, so the RPC
-  // wiring has to. Observers would otherwise miss every bus-originated steer.
+  // The RPC handler emits nothing itself: the event comes from the manager's
+  // onSteered callback wired in src/index.ts. This pins that the bus path
+  // reaches it, so observers do not miss bus-originated steers.
   it("subagents:rpc:steer emits subagents:steered for an RPC-spawned agent", async () => {
     const { pi, lifecycle, busHandlers } = makePi();
     subagentsExtension(pi);

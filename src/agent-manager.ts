@@ -30,7 +30,11 @@ import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorkt
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
-/** Fired by `steer()` once a message is delivered or queued — every steer path goes through it except the steer_subagent tool. */
+/**
+ * Fired by `steer()` once a message is delivered or queued. Every steer path
+ * goes through it except the steer tools (`steer_subagent` in index.ts, and its
+ * nested twin in nested-tools.ts), which await the session directly.
+ */
 export type OnAgentSteered = (record: AgentRecord, message: string) => void;
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
 /**
@@ -1385,7 +1389,8 @@ export class AgentManager {
    * session is created. Returns false if the agent can't accept steering
    * (unknown id, or no longer running/queued). Fires `onSteered` on either
    * accepted path, so the UI viewers, an `@handle` and the RPC all report
-   * the steer the same way without each emitting by hand.
+   * the steer the same way without each emitting by hand. The steer tools
+   * bypass this method because they await delivery.
    */
   steer(id: string, message: string): boolean {
     const record = this.agents.get(id);
