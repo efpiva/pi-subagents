@@ -381,11 +381,22 @@ describe("cross-extension RPC", () => {
       expect(reply).toHaveBeenCalledWith({ success: false, error: "Agent is not running" });
     });
 
-    it("rejects an empty or non-string message before touching the manager", async () => {
+    it("rejects a whitespace-only message before touching the manager", async () => {
       registerRpcHandlers(deps);
       const reply = vi.fn();
       events.on("subagents:rpc:steer:reply:req-m5", reply);
       events.emit("subagents:rpc:steer", { requestId: "req-m5", agentId: "agent-42", message: "   " });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({ success: false, error: "Steer message must be a non-empty string" });
+      expect(manager.steer).not.toHaveBeenCalled();
+    });
+
+    it("rejects a non-string message before touching the manager", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:steer:reply:req-m7", reply);
+      events.emit("subagents:rpc:steer", { requestId: "req-m7", agentId: "agent-42", message: 42 });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(reply).toHaveBeenCalledWith({ success: false, error: "Steer message must be a non-empty string" });

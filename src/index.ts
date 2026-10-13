@@ -867,7 +867,13 @@ export default function (pi: ExtensionAPI) {
             outbox.cancel(record.id);
             return true;
           },
-          steer: (id, message) => manager.steer(id, message),
+          // Same event the steer_subagent tool and an @handle steer emit, so an
+          // observer sees bus steers too; the manager itself never emits it.
+          steer: (id, message) => {
+            if (!manager.steer(id, message)) return false;
+            pi.events.emit("subagents:steered", { id, message });
+            return true;
+          },
         },
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.

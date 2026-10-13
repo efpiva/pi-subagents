@@ -912,7 +912,7 @@ Deliver a message to a running agent you spawned, when something it needs arrive
 pi.events.emit("subagents:rpc:steer", { requestId: crypto.randomUUID(), agentId: "agent-id-here", message: "A second check failed on the same head; include it before you push." });
 ```
 
-Same ownership guard as stop; `Agent is not running` once the agent has settled.
+Same ownership guard as stop; `Agent is not running` once the agent has settled. A successful steer emits `subagents:steered`, exactly as the tool does.
 
 Reply channels are scoped per `requestId`, so concurrent requests don't interfere.
 

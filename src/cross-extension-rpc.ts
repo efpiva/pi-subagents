@@ -1,7 +1,7 @@
 /**
  * Cross-extension RPC handlers for the subagents extension.
  *
- * Exposes ping, spawn, stop, and consume RPCs over the pi.events event bus,
+ * Exposes ping, spawn, stop, consume, and steer RPCs over the pi.events event bus,
  * using per-request scoped reply channels.
  *
  * Reply envelope follows pi-mono convention:
@@ -97,7 +97,7 @@ function handleRpc<P extends { requestId: string }>(
 }
 
 /**
- * Register ping, spawn, stop, and consume RPC handlers on the event bus.
+ * Register ping, spawn, stop, consume, and steer RPC handlers on the event bus.
  * Returns unsub functions for cleanup.
  */
 export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
