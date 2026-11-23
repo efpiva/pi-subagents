@@ -317,7 +317,7 @@ All fields are optional — sensible defaults for everything.
 | `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd. A session outside the parent's session directory (this override, or `isolation: worktree`) is listed separately, so it shows as a root instead of nesting |
 | `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
-| `inherit_context` | `false` | Fork parent conversation into agent |
+| `inherit_context` | `false` | `false`: fresh context; `true`: legacy rendered history; `compacted`: bounded native Pi context captured at actual start, including retained tools/results |
 | `run_in_background` | — | Pin this agent to background (`true`) or foreground (`false`). Omit to follow `backgroundByDefault` |
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
@@ -416,7 +416,7 @@ Launch a sub-agent.
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
-| `inherit_context` | boolean | no | Fork parent conversation into agent |
+| `inherit_context` | boolean or `"compacted"` | no | `true` renders history; `"compacted"` seeds native Pi context after setup. Refuses unavailable/oversized context instead of truncating |
 
 ### `SubagentWorkflow`
 
@@ -776,6 +776,12 @@ const unsub = pi.events.on(`subagents:rpc:ping:reply:${requestId}`, (reply) => {
 pi.events.emit("subagents:rpc:ping", { requestId });
 ```
 
+### Capabilities
+
+`subagents:rpc:capabilities` accepts `{requestId}` and returns the ordinary envelope with data `{version:1,features:{compactedContextV1:true,ownedLifecycleV1:true,synchronousConsumeV1:true},buildId}`. It is available only after bound session activation; legacy ping stays exactly `{version:2}`. Qualify the exact loaded build, not its package version alone.
+
+Native `onAllocated(id)` registers ownership before queue/start/failure. `onSessionCreated(session)` binds the real child before tools run, composed with activity tracking. Consume success **and** failure synchronously inside their lifecycle handlers, including completion before the spawn reply. These callbacks are in-process functions, not serializable model/CLI inputs. [Full contracts and startup budgets](docs/rpc.md#compacted-context).
+
 ### Spawn
 
 Spawn a subagent and receive its ID:
@@ -973,7 +979,8 @@ src/
   model-scope.ts      # scopeModels allowlist policy, shared by top-level and nested tools
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing
   mention-clone.ts    # Run a mention's turn in a cloned conversation, off the main chat
-  cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events
+  cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping/capabilities via pi.events
+  build-identity.ts    # Content identity of source/build tree, package and resolved Pi SDK
 
   # Scheduling
   schedule.ts         # SubagentScheduler: cron / +10m / interval / ISO dispatch

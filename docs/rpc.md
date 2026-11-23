@@ -1,6 +1,6 @@
 # Driving subagents from another extension
 
-Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Five request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`, `subagents:rpc:steer`), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
+Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Six request/reply channels (`subagents:rpc:ping`, `subagents:rpc:capabilities`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`, `subagents:rpc:steer`), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
 
 The thing worth understanding up front is that **the bus is in-process.** Every "RPC" call here is a synchronous `pi.events.emit` into the same event loop, and every reply comes back the same way. That single fact explains most of what follows: why `signal` and the `on*` callbacks work on a spawn payload at all, why a `consume` fired inside a `subagents:completed` handler lands *before* the notification decision has been made, and why none of this survives a real process boundary.
 
@@ -8,7 +8,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 
 ## Spawn options
 
-`subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` (`src/index.ts:698-721`), which deletes internal-only fields first, and then `spawnResolved` (`src/index.ts:666-696`) overwrites the activity-tracker callbacks with its own. The full interface is `SpawnOptions` at `src/agent-manager.ts:169-303`; what a bus caller actually gets is three different things.
+`subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` (`src/index.ts:698-721`), which deletes internal-only fields first, and then `spawnResolved` composes trusted caller callbacks with its own activity tracker. The full interface is `SpawnOptions` at `src/agent-manager.ts:169-303`; what a bus caller actually gets is three different things.
 
 **Honoured** — set these and they take effect:
 
@@ -19,7 +19,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
 | `maxTurns` | number | Turn ceiling for the run |
 | `isolated` | boolean | Strips extensions, skills and nested tools. **Not** a git worktree — see the trap table below |
-| `inheritContext` | boolean | Fork the parent conversation into the child |
+| `inheritContext` | `false \| true \| "compacted"` | `true` renders legacy history; `"compacted"` seeds bounded native Pi messages at actual start. See [compacted context](#compacted-context) |
 | `thinkingLevel` | ThinkingLevel | Clamped to what the resolved model supports |
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
@@ -29,6 +29,8 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
 | `signal` | AbortSignal | Aborting it stops the subagent |
 | `onSpawned` / `onQueued` / `onCompaction` / `onBeforeWorktreeCleanup` | functions | Fire as documented on `SpawnOptions` |
+| `onAllocated` | `(id: string) => void` | Trusted synchronous ownership registration after allocation, before queue/start/failure. A throw refuses execution |
+| `onSessionCreated` | `(session: AgentSession) => void` | Binds the actual child and its SessionManager after extension/tool initialization, before prompting |
 
 **Silently stripped** — set these and nothing happens, with no error and no note. Each deletion is a deliberate guard, and the reasons are worth knowing because they say what the surface refuses to let a caller forge:
 
@@ -43,14 +45,14 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `reclaim` | Bypasses handle allocation, so a forged value would duplicate a live agent's name and make `@handle` ambiguous |
 | `blocking` | Every spawn through here is detached. A forged `blocking` would charge it to the foreground pool and defer it behind a queue whose gate nobody is holding |
 
-**Silently overwritten** — `onToolActivity`, `onTextDelta`, `onTurnEnd`, `onSessionCreated` and `onAssistantUsage` are replaced by the activity tracker's own (`src/index.ts:693`). Every programmatic spawn passes through one funnel so none can supply half-wired callbacks; a half-wired tracker renders worse than none, which is the bug behind a row that reads `thinking…` for an agent's whole life ([#181](https://github.com/tintinweb/pi-subagents/pull/181)).
+**Composed callbacks** — `onToolActivity`, `onTextDelta`, `onTurnEnd`, `onSessionCreated` and `onAssistantUsage` run the activity tracker first, then the trusted caller observer. Neither owner is overwritten. Callback fields accept actual functions only; serialized callback names/objects are refused. They are not Agent-tool or CLI arguments.
 
 Four things that are not obvious from the tables:
 
 - **Nothing is required at runtime.** `description` is non-optional in TypeScript and never validated. A spawn with no `options` at all is legal and is what `test/cross-extension-rpc.test.ts:81-94` pins.
 - **`bypassQueue` is not stripped.** Its own doc comment scopes it to the scheduler and the `/agents` generator, but a bus caller can set it and skip the `maxConcurrent` check.
 - **`structuredOutput` is documented "set only by the workflow host"** (`src/agent-manager.ts:231-234`) and is also not stripped.
-- **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.
+- **`signal` and the `on*` callbacks are native values.** They work only because the bus is in-process. Serialization cannot carry a callback; passing a non-function callback field is refused.
 
 ### Names that look right and are not
 
@@ -151,6 +153,28 @@ It takes an id only, enforces the same top-level ownership guard as stop, and an
 The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone, and shutdown releases it only if this activation claimed it (`src/index.ts:747-750`, `:1105-1107`).
 
 Prefer the bus. The registry has no reply envelope, no version, and no availability event — `globalThis[Symbol.for("pi-subagents:manager")] === undefined` is the only probe you get, and it is also `undefined` in a session that filtered pi-subagents out. Reach for it for the two things the bus has no verb for — *is anything still running*, and *give me a settled record back* — or for a headless host that wants to block on `waitForAll()` before exiting.
+
+## Compacted context
+
+`inheritContext: "compacted"` (Agent/frontmatter `inherit_context: compacted`) snapshots the parent's in-memory selected leaf after asynchronous child setup and immediately before the first prompt. Pi's canonical `buildSessionContext` supplies compaction/branch summaries, retained assistant/tool calls/results and custom model messages. Plain custom state entries, unfinished streaming text and undelivered input are not included. No history rendering or summarizing model is used. Inherited assistant answers never count as the child's result.
+
+The snapshot is detached, seeded as actual child messages and recorded through native SessionManager append APIs, so later child compaction/resume retains the context. Child-local summary entry IDs/timestamps are not parent tree identities. Model, thinking, system prompt and tools remain the child's own choices. Boolean modes keep their existing behavior. Compacted inheritance requires a fresh child; it cannot overlay a resumed session. A frontmatter default seeds only fresh children: reopening a seeded transcript continues it without taking another parent snapshot. An explicit compacted inheritance request with `resumeSessionFile` is refused. Invocation assistant terminal events preserve final text and failure classification if child compaction replaces the seeded history with a shorter array; inherited assistant answers still never count as invocation output.
+
+Startup refuses unavailable context, invalid selected ancestry, unknown model budget, or either exceeded limit: 262,144 serialized UTF-8 bytes and the selected child's context window minus reserves. Token sizes use Pi's `estimateTokens`. The prompt/tool reserve estimates the current child system prompt, requested prompt and active tool schemas; output reserve is the larger of the model's declared maximum output and Pi's configured compaction reserve. This intentionally conservative check does not predict later extension prompt/tool changes. It never silently truncates or falls back to boolean inheritance.
+
+`AgentRecord.contextSnapshot`, terminal event data and `subagents:record` audit entries carry `mode`, `leafId`, `bytes`, `byteLimit`, `tokens`, `tokenLimit`, `contextWindow`, `promptToolReserve`, `outputReserve` and `buildId`. A measured over-budget refusal retains these sizes on the failed record; unavailable context has no successful snapshot. Snapshot metadata proves that boundary only, not future parent input or installed bundle qualification.
+
+## Additive capabilities and owned lifecycle
+
+Send `subagents:rpc:capabilities` with `{requestId}`. The per-request reply uses the ordinary envelope and, when active, returns exactly:
+
+```json
+{"success":true,"data":{"version":1,"features":{"compactedContextV1":true,"ownedLifecycleV1":true,"synchronousConsumeV1":true},"buildId":"sha256:<content digest>"}}
+```
+
+The digest captures this source/build tree, package manifest and resolved Pi SDK manifest once at activation. Source and compiled trees have distinct identities. Qualify the exact immutable loaded artifact, not a package version label. Missing/unreadable identity refuses this capability query without disabling legacy RPC. No handler exists before bound `session_start` or after shutdown. Legacy ping remains exactly `{success:true,data:{version:2}}`.
+
+For owned runs, install the caller's disposition before requesting spawn, then pass native `onAllocated(id)` and `onSessionCreated(session)` callbacks. `onAllocated` runs before queued admission or any start/terminal event, including immediate worktree startup failure. Such an owned failure retains its settled record for synchronous consumption and still returns the existing spawn error envelope. Ordinary unowned startup failures retain their old record-removal behavior. Run completion can precede the spawn reply: correlate by the allocated ID, not response timing. Consume both `subagents:completed` and `subagents:failed` synchronously, before any await. The existing consume path suppresses the generic parent notification. This is mechanism only, not a quiet-policy implementation or an OS sandbox.
 
 ## Protocol versions
 

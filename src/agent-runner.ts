@@ -10,14 +10,17 @@ import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-
 import {
   type AgentSession,
   type AgentSessionEvent,
+  buildSessionContext,
   createAgentSession,
   DefaultResourceLoader,
   type ExtensionAPI,
+  estimateTokens,
   getAgentDir,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { getForkBuildId } from "./build-identity.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
@@ -27,7 +30,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { ContextInheritance, ContextSnapshot, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 
@@ -403,7 +406,9 @@ export interface RunOptions {
   maxTurns?: number;
   signal?: AbortSignal;
   isolated?: boolean;
-  inheritContext?: boolean;
+  inheritContext?: ContextInheritance;
+  /** Actual startup snapshot, including measured sizes on a budget refusal. */
+  onContextSnapshot?: (snapshot: ContextSnapshot) => void;
   thinkingLevel?: ThinkingLevel;
   /**
    * Reopen this pi session file rather than starting an empty conversation.
@@ -523,12 +528,13 @@ export interface RunResult {
   structuredRetried?: boolean;
 }
 
-/**
- * Subscribe to a session and collect the last assistant message text.
- * Returns an object with a `getText()` getter and an `unsubscribe` function.
- */
+type AssistantResponse = Extract<AgentSession["messages"][number], { role: "assistant" }>;
+
+/** Collect only this invocation's assistant evidence, independent of compaction. */
 function collectResponseText(session: AgentSession) {
   let text = "";
+  let lastNonEmptyText = "";
+  let finalMessage: AssistantResponse | undefined;
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     // message_start also fires for user and toolResult messages — resetting on
     // those would wipe assistant text already collected. Reset only when a new
@@ -539,8 +545,17 @@ function collectResponseText(session: AgentSession) {
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       text += event.assistantMessageEvent.delta;
     }
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      finalMessage = event.message;
+      const finalText = extractText(event.message.content ?? []);
+      if (finalText.trim()) lastNonEmptyText = finalText;
+    }
   });
-  return { getText: () => text, unsubscribe };
+  return {
+    getText: () => text.trim() ? text : lastNonEmptyText,
+    getFinalMessage: () => finalMessage,
+    unsubscribe,
+  };
 }
 
 /**
@@ -571,20 +586,26 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
  * Everything else completes: a clean "stop"/"toolUse" final, and — crucially — a
  * "length" stop that DID produce text (a legitimate truncated-but-useful answer).
  * "aborted" is handled by the manager's abort flag / "stopped" guard, not here.
- * Bounded by `startIndex` (like the text fallback) so a resume that produced no
- * assistant message of its own never inherits a PRIOR turn's stop reason.
+ * Prefer the invocation's terminal event: compaction may replace the history
+ * with a shorter array. The bounded history fallback supports eventless callers
+ * without inheriting a PRIOR turn's stop reason on resume.
  */
-function finalTurnError(session: AgentSession, startIndex = 0): string | undefined {
-  for (let i = session.messages.length - 1; i >= startIndex; i--) {
-    const msg = session.messages[i];
-    if (msg.role !== "assistant") continue;
-    if (msg.stopReason === "error") {
-      return (msg as { errorMessage?: string }).errorMessage?.trim() || "provider error with no output";
+function finalTurnError(session: AgentSession, startIndex = 0, finalMessage?: AssistantResponse): string | undefined {
+  let msg = finalMessage;
+  if (!msg) {
+    for (let i = session.messages.length - 1; i >= startIndex; i--) {
+      const candidate = session.messages[i];
+      if (candidate.role === "assistant") {
+        msg = candidate;
+        break;
+      }
     }
-    if (msg.stopReason === "length" && !extractText(msg.content).trim()) {
-      return "run hit the output token limit before producing any text";
-    }
-    return undefined;
+  }
+  if (msg?.stopReason === "error") {
+    return msg.errorMessage?.trim() || "provider error with no output";
+  }
+  if (msg?.stopReason === "length" && !extractText(msg.content).trim()) {
+    return "run hit the output token limit before producing any text";
   }
   return undefined;
 }
@@ -1042,6 +1063,8 @@ export async function runAgent(
     });
   }
 
+  // Preserve the callback's fully initialized tool view, before any model turn.
+  // Earlier setup failures remain correlated by the manager's onAllocated ID.
   options.onSessionCreated?.(session);
 
   // Track turns for graceful max_turns enforcement
@@ -1096,20 +1119,71 @@ export async function runAgent(
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  // Build the effective prompt: optionally prepend parent context
-  let effectivePrompt = prompt;
-  if (options.inheritContext) {
-    const parentContext = buildParentContext(ctx);
-    if (parentContext) {
-      effectivePrompt = parentContext + prompt;
-    }
-  }
-
-  // Boundary for the history fallback: only assistant text produced from here
-  // on counts as this run's output (a fresh session, so usually 0).
-  const startLen = session.messages.length;
+  // Set after seeding: inherited assistant output never belongs to this run.
+  let startLen = session.messages.length;
   let structuredRetried = false;
   try {
+    let effectivePrompt = prompt;
+    const inheritance = options.inheritContext ?? (!options.resumeSessionFile && agentConfig?.inheritContext === "compacted" ? "compacted" : false);
+    if (typeof inheritance !== "boolean" && inheritance !== "compacted") throw new Error("Unsupported context inheritance mode");
+    if (inheritance === "compacted") {
+      if (options.resumeSessionFile) throw new Error("Compacted context requires a fresh child session");
+      // All asynchronous setup has finished. No await between snapshot and prompt.
+      const parent = ctx.sessionManager;
+      if (!parent?.getEntries || !parent.getLeafId) throw new Error("Compacted context unavailable: no in-memory parent");
+      const entries = parent.getEntries();
+      const leafId = parent.getLeafId();
+      const byId = new Map(entries.map(entry => [entry.id, entry]));
+      const seen = new Set<string>();
+      for (let id = leafId; id !== null;) {
+        const entry = byId.get(id);
+        if (!entry || seen.has(id)) throw new Error("Compacted context unavailable: invalid selected path");
+        seen.add(id);
+        id = entry.parentId;
+      }
+      const projected = buildSessionContext(entries, leafId).messages;
+      // Detach the snapshot from mutable parent message objects, not a rendering.
+      const serialized = JSON.stringify(projected);
+      const messages: typeof projected = JSON.parse(serialized);
+      const selectedModel = session.model;
+      const contextWindow = selectedModel?.contextWindow;
+      const maxTokens = selectedModel?.maxTokens;
+      if (!contextWindow || !maxTokens || !Number.isFinite(contextWindow) || !Number.isFinite(maxTokens)) {
+        throw new Error("Compacted context unavailable: selected model has no input/output budget");
+      }
+      const outputReserve = Math.max(maxTokens, settingsManager.getCompactionSettings().reserveTokens);
+      const tools = session.agent.state.tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters }));
+      const promptToolReserve = estimateTokens({
+        role: "user", content: `${session.agent.state.systemPrompt}\n${prompt}\n${JSON.stringify(tools)}`, timestamp: Date.now(),
+      });
+      const snapshot: ContextSnapshot = {
+        mode: "compacted", leafId, bytes: Buffer.byteLength(serialized, "utf8"), byteLimit: 256 * 1024,
+        tokens: messages.reduce((total, message) => total + estimateTokens(message), 0),
+        tokenLimit: Math.max(0, contextWindow - outputReserve - promptToolReserve),
+        contextWindow, promptToolReserve, outputReserve, buildId: getForkBuildId(),
+      };
+      options.onContextSnapshot?.(snapshot);
+      if (snapshot.bytes > snapshot.byteLimit || snapshot.tokens > snapshot.tokenLimit || outputReserve + promptToolReserve >= contextWindow) {
+        throw new Error(`Compacted context exceeds startup budget: ${snapshot.bytes}/${snapshot.byteLimit} bytes, ${snapshot.tokens}/${snapshot.tokenLimit} tokens`);
+      }
+      // Native persistence mirrors the seeded messages. The boundary anchors a
+      // projected compaction's kept tail in THIS child's tree, not the parent's.
+      const boundary = sessionManager.appendCustomEntry("subagents:context-snapshot", snapshot);
+      for (const message of messages) {
+        if (message.role === "compactionSummary") {
+          sessionManager.appendCompaction(message.summary, boundary, message.tokensBefore);
+        } else if (message.role === "branchSummary") {
+          sessionManager.branchWithSummary(sessionManager.getLeafId(), message.summary);
+        } else {
+          sessionManager.appendMessage(message);
+        }
+      }
+      session.agent.state.messages.push(...messages);
+    } else if (inheritance === true) {
+      const parentContext = buildParentContext(ctx);
+      if (parentContext) effectivePrompt = parentContext + prompt;
+    }
+    startLen = session.messages.length;
     await session.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
@@ -1142,7 +1216,7 @@ export async function runAgent(
     session,
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
+    failure: finalTurnError(session, startLen, collector.getFinalMessage()) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };
@@ -1198,7 +1272,7 @@ export async function resumeAgent(
 
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
+    failure: finalTurnError(session, startLen, collector.getFinalMessage()),
   };
 }
 

@@ -18,10 +18,16 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as Worktree from "../src/worktree.js";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
   return { ...actual, runAgent: vi.fn() };
+});
+
+vi.mock("../src/worktree.js", async () => {
+  const actual = await vi.importActual<typeof Worktree>("../src/worktree.js");
+  return { ...actual, createWorktree: vi.fn(async () => null) };
 });
 
 import { runAgent } from "../src/agent-runner.js";
@@ -164,6 +170,72 @@ describe("subagents:rpc:consume", () => {
     await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
 
     expect(notifications(pi)).toEqual([]);
+  });
+
+  it.each(["completed", "failed"])("owns and synchronously consumes an early %s before the spawn reply", async (terminal) => {
+    if (terminal === "completed") vi.mocked(runAgent).mockResolvedValue({ responseText: "owned answer" } as never);
+    else vi.mocked(runAgent).mockRejectedValue(new Error("immediate child setup failure"));
+    const { pi, bus } = await boot();
+    const order: string[] = [];
+    let ownedId: string | undefined;
+    bus.on(`subagents:${terminal}`, (data) => {
+      const { id } = data as { id: string };
+      expect(id).toBe(ownedId);
+      order.push("terminal");
+      bus.emit("subagents:rpc:consume", { requestId: "early-consume", agentId: id });
+    });
+    const reply = vi.fn(() => order.push("reply"));
+    bus.on("subagents:rpc:spawn:reply:owned", reply);
+    bus.emit("subagents:rpc:spawn", { requestId: "owned", type: "general-purpose", prompt: "go", options: {
+      description: "owned", isBackground: true,
+      onAllocated: (id: string) => { ownedId = id; order.push("allocated"); },
+    } });
+    await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+    expect(order).toEqual(["allocated", "terminal", "reply"]);
+    await new Promise(resolve => setTimeout(resolve, PAST_THE_HOLD_MS));
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it("retains allocated ownership through immediate startup failure before running", async () => {
+    const { pi, bus } = await boot();
+    let ownedId: string | undefined;
+    const failure = vi.fn((data: unknown) => {
+      const { id } = data as { id: string };
+      expect(id).toBe(ownedId);
+      bus.emit("subagents:rpc:consume", { requestId: "startup-consume", agentId: id });
+    });
+    bus.on("subagents:failed", failure);
+    const reply = vi.fn();
+    bus.on("subagents:rpc:spawn:reply:startup", reply);
+    bus.emit("subagents:rpc:spawn", { requestId: "startup", type: "general-purpose", prompt: "go", options: {
+      description: "startup failure", isBackground: true, isolation: "worktree",
+      onAllocated: (id: string) => { ownedId = id; },
+    } });
+    await vi.waitFor(() => expect(reply).toHaveBeenCalledWith({ success: false, error: expect.stringContaining("Cannot run with isolation") }));
+    expect(failure).toHaveBeenCalledTimes(1);
+    const registry = (globalThis as Record<symbol, { getRecord(id: string): { resultConsumed?: boolean } }>)[Symbol.for("pi-subagents:manager")];
+    expect(registry.getRecord(ownedId!)?.resultConsumed).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, PAST_THE_HOLD_MS));
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it("registers allocated IDs before queue admission and calls the owner once", async () => {
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false, maxConcurrent: 1 }));
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    const { bus } = await boot();
+    await spawnOverRpc(bus, "fill-pool");
+    const order: string[] = [];
+    const allocated = vi.fn(() => order.push("allocated"));
+    const queued = vi.fn(() => order.push("queued"));
+    const reply = vi.fn();
+    bus.on("subagents:rpc:spawn:reply:queued", reply);
+    bus.emit("subagents:rpc:spawn", { requestId: "queued", type: "general-purpose", prompt: "go", options: {
+      description: "queued", isBackground: true, onAllocated: allocated, onQueued: queued,
+    } });
+    await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+    expect(order).toEqual(["allocated", "queued"]);
+    expect(allocated).toHaveBeenCalledTimes(1);
+    expect(allocated.mock.calls[0]).toEqual(queued.mock.calls[0].slice(0, 1));
   });
 
   it("refuses to consume an agent that is still running", async () => {

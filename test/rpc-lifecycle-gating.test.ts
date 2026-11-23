@@ -28,7 +28,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
-const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
+const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:capabilities", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -193,9 +193,12 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     });
     const extensionCtx = ctx(true, setWidget);
     let onToolActivity: ((activity: { type: "start" | "end"; toolName: string }) => void) | undefined;
+    const childSession = { subscribe: () => vi.fn(), sessionManager: { getSessionId: () => "actual-child" } };
+    const onSessionCreated = vi.fn();
+    const observedTool = vi.fn(() => expect(onSessionCreated).toHaveBeenCalledWith(childSession));
     vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options: any) => {
       onToolActivity = options.onToolActivity;
-      options.onSessionCreated?.({ subscribe: () => vi.fn() });
+      options.onSessionCreated?.(childSession);
       return new Promise(() => {}) as any;
     });
     subagentsExtension(pi);
@@ -208,10 +211,12 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
       requestId: "req-activity",
       type: "general-purpose",
       prompt: "go",
-      options: { description: "rpc activity test", isBackground: true },
+      options: { description: "rpc activity test", isBackground: true, onSessionCreated, onToolActivity: observedTool },
     });
     await vi.waitFor(() => expect(onToolActivity).toBeTypeOf("function"));
     onToolActivity!({ type: "start", toolName: "bash" });
+    expect(onSessionCreated).toHaveBeenCalledTimes(1);
+    expect(observedTool).toHaveBeenCalledWith({ type: "start", toolName: "bash" });
 
     expect(widgetFactory).toBeTypeOf("function");
     const lines = widgetFactory(
@@ -220,6 +225,22 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     ).render().join("\n");
     expect(lines).toContain("running command…");
     expect(lines).not.toContain("thinking…");
+  });
+
+  it("rejects serialized ownership callbacks rather than treating JSON as native code", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+    vi.mocked(runAgent).mockClear();
+    await busHandlers.get("subagents:rpc:spawn")!({
+      requestId: "serialized", type: "general-purpose", prompt: "go",
+      options: { description: "bad owner", onAllocated: "callback" },
+    });
+    expect(pi.events.emit).toHaveBeenCalledWith("subagents:rpc:spawn:reply:serialized", {
+      success: false, error: "SpawnOptions.onAllocated must be an in-process function",
+    });
+    expect(runAgent).not.toHaveBeenCalled();
+    await lifecycle.get("session_shutdown")();
   });
 
   it("is idempotent — a second session_start does not re-advertise or double-register", async () => {

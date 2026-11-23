@@ -62,10 +62,13 @@ describe("mention clone tool reachability against real pi-mono", () => {
   beforeEach(() => {
     sessions.length = 0;
     cwd = mkdtempSync(join(tmpdir(), "subagents-mention-clone-"));
+    // Real session construction must not load the developer's global extensions.
+    vi.stubEnv("PI_CODING_AGENT_DIR", cwd);
     faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
   });
   afterEach(() => {
     faux.unregister();
+    vi.unstubAllEnvs();
     rmSync(cwd, { recursive: true, force: true });
   });
 

@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import type * as PiSdk from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
@@ -28,10 +29,16 @@ const {
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
   sessionManagerOpen: vi.fn(() => ({ kind: "reopened-session-manager" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
-  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir,
+    getCompactionSettings: () => ({ reserveTokens: 16384 }),
+  })),
 }));
 
-vi.mock("@earendil-works/pi-coding-agent", () => ({
+vi.mock("@earendil-works/pi-coding-agent", async () => {
+  const actual = await vi.importActual<typeof PiSdk>("@earendil-works/pi-coding-agent");
+  return {
+  buildSessionContext: actual.buildSessionContext,
+  estimateTokens: actual.estimateTokens,
   createAgentSession,
   // Identity, as pi's own is: `defineTool` exists for the type inference, and
   // the structured-output tool is built through it.
@@ -66,7 +73,8 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir,
   SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate, open: sessionManagerOpen },
   SettingsManager: { create: settingsManagerCreate },
-}));
+};
+});
 
 vi.mock("../src/agent-types.js", () => ({
   BUILTIN_TOOL_NAMES: ["read", "bash", "edit", "write", "grep", "find", "ls"],
@@ -121,6 +129,7 @@ vi.mock("../src/nested-tools.js", () => ({
   ]),
 }));
 
+import { AgentManager } from "../src/agent-manager.js";
 import {
   extensionCanonicalName,
   extensionCanonicalNames,
@@ -176,12 +185,15 @@ function createSession(finalText: string) {
     }),
     // pi's Agent; `beforeToolCall` is an optional, assignable hook the scope
     // installer wraps to block out-of-scope calls on turn 1.
-    agent: { beforeToolCall: undefined } as {
+    agent: { beforeToolCall: undefined, state: { messages: [] as unknown[], tools: [], systemPrompt: "system prompt" } } as {
       beforeToolCall?: (context: any, signal?: any) => Promise<any>;
+      state: { messages: unknown[]; tools: unknown[]; systemPrompt: string };
     },
+    model: { provider: "test", id: "child", contextWindow: 200000, maxTokens: 32000 },
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
   };
+  session.agent.state.messages = session.messages;
   lastSession = session;
   return { session, listeners };
 }
@@ -215,6 +227,221 @@ beforeEach(() => {
   vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
+});
+
+describe("agent-runner compacted inheritance", () => {
+  async function setup() {
+    const sdk = await vi.importActual<typeof PiSdk>("@earendil-works/pi-coding-agent");
+    const parent = sdk.SessionManager.inMemory("/tmp");
+    const child = sdk.SessionManager.inMemory("/tmp");
+    sessionManagerCreate.mockReturnValueOnce(child);
+    const { session, listeners } = createSession("");
+    createAgentSession.mockResolvedValueOnce({ session });
+    const context = { ...ctx, sessionManager: parent };
+    return { sdk, parent, child, session, listeners, context };
+  }
+
+  it("seeds canonical compacted messages, retained tools and custom context, without returning inherited assistant output", async () => {
+    const { sdk, parent, child, session, context } = await setup();
+    parent.appendMessage({ role: "user", content: "discard me", timestamp: 1 });
+    const kept = parent.appendMessage({ role: "user", content: "retained", timestamp: 2 });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "a" } }], timestamp: 3 } as never);
+    parent.appendMessage({ role: "toolResult", toolCallId: "t1", toolName: "read", content: [{ type: "text", text: "tool evidence" }], isError: false, timestamp: 4 });
+    parent.appendCompaction("current summary", kept, 5000);
+    parent.appendCustomMessageEntry("context", "visible custom context", false);
+    parent.appendCustomEntry("not-context", { secret: "not model context" });
+    parent.appendMessage({ role: "assistant", content: [{ type: "text", text: "PARENT ANSWER" }], timestamp: 5 } as never);
+    const expected = sdk.buildSessionContext(parent.getEntries(), parent.getLeafId()).messages;
+    session.prompt.mockImplementation(async () => {});
+    const onContextSnapshot = vi.fn();
+
+    const result = await runAgent(context, "Explore", "new task", { pi, inheritContext: "compacted", onContextSnapshot });
+
+    expect(session.agent.state.messages).toEqual(expected);
+    expect(session.prompt).toHaveBeenCalledWith("new task");
+    expect(result.responseText).toBe("");
+    expect(result.failure).toBeUndefined();
+    // Native persistence reprojects the same roles/content, with child-local timestamps.
+    const reloaded = child.buildSessionContext().messages;
+    expect(reloaded.map(({ timestamp: _time, ...message }) => message))
+      .toEqual(expected.map(({ timestamp: _time, ...message }) => message));
+    expect(JSON.stringify(expected)).not.toContain("discard me");
+    expect(JSON.stringify(expected)).toContain("tool evidence");
+    expect(JSON.stringify(expected)).not.toContain("not model context");
+    expect(onContextSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+      leafId: parent.getLeafId(), bytes: Buffer.byteLength(JSON.stringify(expected)), byteLimit: 262144,
+      contextWindow: 200000, outputReserve: 32000, buildId: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    }));
+    const snapshot = onContextSnapshot.mock.calls[0][0];
+    expect(snapshot.tokenLimit).toBe(200000 - 32000 - snapshot.promptToolReserve);
+    // Detachment prevents a child from mutating a parent message object.
+    expect(session.messages[0]).not.toBe(expected[0]);
+  });
+
+  it("accepts empty compacted context and captures after asynchronous setup", async () => {
+    const { parent, session, context } = await setup();
+    const owner = vi.fn();
+    session.bindExtensions.mockImplementationOnce(async () => {
+      expect(owner).not.toHaveBeenCalled();
+      await Promise.resolve();
+      // A selected empty branch is valid, including before any parent prompt.
+      parent.resetLeaf();
+    });
+    const snapshot = vi.fn();
+    await runAgent(context, "Explore", "go", { pi, inheritContext: "compacted", onSessionCreated: owner, onContextSnapshot: snapshot });
+    expect(owner).toHaveBeenCalledWith(session);
+    expect(owner.mock.invocationCallOrder[0]).toBeLessThan(snapshot.mock.invocationCallOrder[0]);
+    expect(snapshot).toHaveBeenCalledWith(expect.objectContaining({ leafId: null, bytes: 2, tokens: 0 }));
+  });
+
+  it("captures compacted messages added during asynchronous extension setup", async () => {
+    const { parent, session, context } = await setup();
+    session.bindExtensions.mockImplementationOnce(async () => {
+      await Promise.resolve();
+      parent.appendMessage({ role: "user", content: "arrived during setup", timestamp: 1 });
+    });
+    await runAgent(context, "Explore", "go", { pi, inheritContext: "compacted" });
+    expect(session.messages[0].content).toBe("arrived during setup");
+  });
+
+  it("captures a queued compacted child's selected leaf only at actual start", async () => {
+    const { sdk, parent, session: first, context } = await setup();
+    let release!: () => void;
+    first.prompt.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    const second = createSession("").session;
+    const secondChild = sdk.SessionManager.inMemory("/tmp");
+    sessionManagerCreate.mockReturnValueOnce(secondChild);
+    createAgentSession.mockResolvedValueOnce({ session: second });
+    const manager = new AgentManager(undefined, 1);
+    try {
+      const firstId = manager.spawn(pi, context, "Explore", "first", { description: "first", isBackground: true });
+      await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+      const secondId = manager.spawn(pi, context, "Explore", "second", { description: "second", isBackground: true, inheritContext: "compacted" });
+      expect(manager.getRecord(secondId)?.status).toBe("queued");
+      parent.appendMessage({ role: "user", content: "new selected leaf while queued", timestamp: 1 });
+      const leaf = parent.getLeafId();
+      release();
+      await manager.getRecord(firstId)?.promise;
+      await manager.waitForAll();
+      expect(second.messages[0].content).toBe("new selected leaf while queued");
+      expect(manager.getRecord(secondId)?.contextSnapshot?.leafId).toBe(leaf);
+    } finally { await manager.dispose(); }
+  });
+
+  it.each([false, true] as const)("keeps boolean inheritance %s on its original path", async (inheritContext) => {
+    const { parent, session, context } = await setup();
+    parent.appendMessage({ role: "user", content: "legacy context", timestamp: 1 });
+    await runAgent(context, "Explore", "task", { pi, inheritContext });
+    expect(session.messages).toHaveLength(1); // only this child's assistant message
+    expect(session.prompt.mock.calls[0][0]).toEqual(inheritContext ? expect.stringContaining("# Parent Conversation Context") : "task");
+  });
+
+  it("uses compacted frontmatter only for a fresh child", async () => {
+    const { parent, session, context } = await setup();
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ inheritContext: "compacted" }));
+    parent.appendMessage({ role: "user", content: "fresh seed", timestamp: 1 });
+    const snapshot = vi.fn();
+
+    await runAgent(context, "Explore", "go", { pi, onContextSnapshot: snapshot });
+
+    expect(session.messages[0].content).toBe("fresh seed");
+    expect(snapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues a seeded transcript without reapplying implicit compacted frontmatter", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ inheritContext: "compacted" }));
+    const { session } = createSession("CONTINUED");
+    session.messages.push({ role: "assistant", content: [{ type: "text", text: "ALREADY SEEDED" }] });
+    createAgentSession.mockResolvedValueOnce({ session });
+    const getEntries = vi.fn(() => { throw new Error("must not resnapshot the parent"); });
+    const snapshot = vi.fn();
+
+    const result = await runAgent({ ...ctx, sessionManager: { ...ctx.sessionManager, getEntries } }, "Explore", "continue", {
+      pi, resumeSessionFile: "/sessions/seeded.jsonl", onContextSnapshot: snapshot,
+    });
+
+    expect(result.responseText).toBe("CONTINUED");
+    expect(result.failure).toBeUndefined();
+    expect(session.prompt).toHaveBeenCalledWith("continue");
+    expect(sessionManagerOpen).toHaveBeenCalledWith("/sessions/seeded.jsonl", undefined);
+    expect(getEntries).not.toHaveBeenCalled();
+    expect(snapshot).not.toHaveBeenCalled();
+  });
+
+  it("still refuses explicit compacted inheritance over a resumed transcript", async () => {
+    const { session } = createSession("");
+    createAgentSession.mockResolvedValueOnce({ session });
+
+    await expect(runAgent(ctx, "Explore", "go", {
+      pi, inheritContext: "compacted", resumeSessionFile: "/sessions/seeded.jsonl",
+    })).rejects.toThrow("Compacted context requires a fresh child session");
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { stopReason: "error", text: "", errorMessage: "compacted provider failure", failure: "compacted provider failure" },
+    { stopReason: "error", text: "new partial", errorMessage: "compacted stream failed", failure: "compacted stream failed" },
+    { stopReason: "length", text: "", errorMessage: undefined, failure: "run hit the output token limit before producing any text" },
+    { stopReason: "stop", text: "new final answer", errorMessage: undefined, failure: undefined },
+    { stopReason: "stop", text: "", errorMessage: undefined, failure: undefined, progress: "this invocation's progress" },
+  ] as const)("keeps invocation terminal $stopReason evidence after seeded history is compacted ($text)", async (final) => {
+    const { parent, session, listeners, context } = await setup();
+    for (let i = 0; i < 6; i++) {
+      parent.appendMessage({ role: "assistant", content: [{ type: "text", text: "INHERITED ANSWER" }], timestamp: i } as never);
+    }
+    session.prompt.mockImplementation(async () => {
+      // Native compaction replaces the message array. The final message now
+      // lies below the original seeded-history length, and no text deltas fire.
+      if ("progress" in final) {
+        const progress = { role: "assistant", content: [{ type: "text", text: final.progress }], stopReason: "toolUse" };
+        for (const listener of listeners) listener({ type: "message_end", message: progress });
+      }
+      const message = { role: "assistant", content: [{ type: "text", text: final.text }],
+        stopReason: final.stopReason, errorMessage: final.errorMessage };
+      session.messages = [{ role: "compactionSummary", summary: "shorter context" }, message];
+      session.agent.state.messages = session.messages;
+      for (const listener of listeners) listener({ type: "message_end", message });
+    });
+
+    const result = await runAgent(context, "Explore", "go", { pi, inheritContext: "compacted" });
+
+    expect(result.failure).toBe(final.failure);
+    expect(result.responseText).toBe(("progress" in final ? final.progress : undefined) ?? final.text);
+  });
+
+  it("refuses unavailable compacted context without a boolean fallback", async () => {
+    const { session, context } = await setup();
+    context.sessionManager = undefined;
+    await expect(runAgent(context, "Explore", "go", { pi, inheritContext: "compacted" })).rejects.toThrow("no in-memory parent");
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unavailable selected leaf rather than projecting the last entry", async () => {
+    const { parent, session, context } = await setup();
+    vi.spyOn(parent, "getLeafId").mockReturnValue("absent");
+    await expect(runAgent(context, "Explore", "go", { pi, inheritContext: "compacted" })).rejects.toThrow("invalid selected path");
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it.each(["bytes", "model", "prompt"])("refuses compacted context exceeding the %s budget and reports actual limits", async (budget) => {
+    const { parent, child, session, context } = await setup();
+    parent.appendMessage({ role: "user", content: budget === "bytes" ? "é".repeat(140000) : "x".repeat(1000), timestamp: 1 });
+    if (budget === "model") session.model = { ...session.model, contextWindow: 32200 };
+    const snapshot = vi.fn();
+    await expect(runAgent(context, "Explore", budget === "prompt" ? "x".repeat(800000) : "go", {
+      pi, inheritContext: "compacted", onContextSnapshot: snapshot,
+    })).rejects.toThrow("exceeds startup budget");
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(child.getEntries()).toEqual([]); // refusal precedes inherited persistence
+  });
+
+  it("refuses compacted context when the selected model budget is unknown", async () => {
+    const { session, context } = await setup();
+    session.model = undefined as never;
+    await expect(runAgent(context, "Explore", "go", { pi, inheritContext: "compacted" })).rejects.toThrow("no input/output budget");
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
 });
 
 describe("agent-runner final output capture", () => {
@@ -520,6 +747,25 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
 
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
     expect(result.text).toBe("new partial"); // this resume's progress, not the prior answer
+  });
+
+  it.each(["error", "stop"] as const)("resume preserves invocation terminal %s evidence after compaction", async (stopReason) => {
+    const { session, listeners } = createSession("");
+    for (let i = 0; i < 6; i++) {
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "PREVIOUS ANSWER" }] });
+    }
+    session.prompt.mockImplementation(async () => {
+      const message = { role: "assistant", content: [{ type: "text", text: stopReason === "stop" ? "RESUMED ANSWER" : "" }],
+        stopReason, errorMessage: "resumed provider failure" };
+      session.messages = [{ role: "compactionSummary", summary: "shorter context" }, message];
+      session.agent.state.messages = session.messages;
+      for (const listener of listeners) listener({ type: "message_end", message });
+    });
+
+    const result = await resumeAgent(session as never, "continue");
+
+    expect(result.text).toBe(stopReason === "stop" ? "RESUMED ANSWER" : "");
+    expect(result.failure).toBe(stopReason === "error" ? "resumed provider failure" : undefined);
   });
 
   it("collector: a toolResult/user message_start no longer wipes collected assistant text", async () => {

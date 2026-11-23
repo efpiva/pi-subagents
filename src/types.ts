@@ -30,6 +30,23 @@ export type MemoryScope = "user" | "project" | "local";
  */
 export type IsolationMode = "worktree" | "off";
 
+/** true keeps legacy rendered history; compacted seeds Pi's native context. */
+export type ContextInheritance = boolean | "compacted";
+
+/** Actual compacted snapshot and startup budget, not an installed-build attestation. */
+export interface ContextSnapshot {
+  mode: "compacted";
+  leafId: string | null;
+  bytes: number;
+  byteLimit: number;
+  tokens: number;
+  tokenLimit: number;
+  contextWindow: number;
+  promptToolReserve: number;
+  outputReserve: number;
+  buildId: string;
+}
+
 /** Unified agent configuration — used for both default and user-defined agents. */
 export interface AgentConfig {
   name: string;
@@ -67,8 +84,8 @@ export interface AgentConfig {
   allowedSubagents?: "all" | string[];
   systemPrompt: string;
   promptMode: "replace" | "append";
-  /** Default for spawn: fork parent conversation. undefined = caller decides. */
-  inheritContext?: boolean;
+  /** Default for spawn: inherit parent context. undefined = caller decides. */
+  inheritContext?: ContextInheritance;
   /** Default for spawn: run in background. undefined = caller decides. */
   runInBackground?: boolean;
   /** Default for spawn: no extension tools. undefined = caller decides. */
@@ -217,6 +234,8 @@ export interface AgentRecord {
    * in-memory session, which leaves nothing to reopen.
    */
   sessionFile?: string;
+  /** Context captured at actual start, after asynchronous child setup. */
+  contextSnapshot?: ContextSnapshot;
   /** Cleanup function for the output file stream subscription. */
   outputCleanup?: () => void;
   /**
@@ -299,7 +318,7 @@ export interface AgentInvocation {
   requestedModel?: string;
   maxTurns?: number;
   isolated?: boolean;
-  inheritContext?: boolean;
+  inheritContext?: ContextInheritance;
   runInBackground?: boolean;
   isolation?: IsolationMode;
 }

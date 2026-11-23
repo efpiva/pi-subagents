@@ -76,6 +76,39 @@ describe("cross-extension RPC", () => {
     });
   });
 
+  describe("capabilities RPC", () => {
+    it("returns the additive v1 contract while keeping ping exactly v2", async () => {
+      registerRpcHandlers(deps);
+      const capability = vi.fn();
+      const ping = vi.fn();
+      events.on("subagents:rpc:capabilities:reply:cap-1", capability);
+      events.on("subagents:rpc:ping:reply:ping-1", ping);
+      events.emit("subagents:rpc:capabilities", { requestId: "cap-1" });
+      events.emit("subagents:rpc:ping", { requestId: "ping-1" });
+      await vi.waitFor(() => expect(capability).toHaveBeenCalled());
+      expect(capability).toHaveBeenCalledWith({ success: true, data: {
+        version: 1,
+        features: { compactedContextV1: true, ownedLifecycleV1: true, synchronousConsumeV1: true },
+        buildId: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      } });
+      expect(ping).toHaveBeenCalledWith({ success: true, data: { version: 2 } });
+    });
+
+    it("refuses without an active session and unregisters independently", async () => {
+      const { unsubCapabilities } = registerRpcHandlers(deps);
+      ctx = undefined;
+      const reply = vi.fn();
+      events.on("subagents:rpc:capabilities:reply:cap-2", reply);
+      events.emit("subagents:rpc:capabilities", { requestId: "cap-2" });
+      await vi.waitFor(() => expect(reply).toHaveBeenCalledWith({ success: false, error: "No active session" }));
+      reply.mockClear();
+      unsubCapabilities();
+      events.emit("subagents:rpc:capabilities", { requestId: "cap-2" });
+      await Promise.resolve();
+      expect(reply).not.toHaveBeenCalled();
+    });
+  });
+
   // --- spawn ---
 
   describe("spawn RPC", () => {

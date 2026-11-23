@@ -30,6 +30,7 @@ import type {
   AgentConfig,
   AgentInvocation,
   AgentRecord,
+  ContextInheritance,
   IsolationMode,
   ThinkingLevel,
 } from "./types.js";
@@ -54,7 +55,7 @@ interface NestedSpawnOptions {
   model?: Model<any>;
   maxTurns?: number;
   isolated?: boolean;
-  inheritContext?: boolean;
+  inheritContext?: ContextInheritance;
   thinkingLevel?: ThinkingLevel;
   isBackground?: boolean;
   isolation?: IsolationMode;
@@ -177,7 +178,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       ),
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
       isolated: Type.Optional(Type.Boolean()),
-      inherit_context: Type.Optional(Type.Boolean()),
+      inherit_context: Type.Optional(Type.Union([Type.Boolean(), Type.Literal("compacted")])),
       ...isolationParam(isWorktreeIsolationEnabled()),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {

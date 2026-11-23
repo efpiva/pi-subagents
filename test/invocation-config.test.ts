@@ -51,6 +51,12 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.isolation).toBe("worktree");
   });
 
+  it("carries compacted inheritance without coercion and preserves frontmatter precedence", () => {
+    expect(resolveAgentInvocationConfig(undefined, { inherit_context: "compacted" }).inheritContext).toBe("compacted");
+    expect(resolveAgentInvocationConfig(makeConfig({ inheritContext: "compacted" }), { inherit_context: true }).inheritContext).toBe("compacted");
+    expect(resolveAgentInvocationConfig(makeConfig({ inheritContext: false }), { inherit_context: "compacted" }).inheritContext).toBe(false);
+  });
+
   it("uses tool-call params when no agent config is available", () => {
     const resolved = resolveAgentInvocationConfig(undefined, {
       model: "provider/param-model",

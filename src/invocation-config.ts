@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import type { AgentConfig, ContextInheritance, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
 /**
  * The model-facing `isolation` parameter, shared by the `Agent` tool and the
@@ -59,7 +59,7 @@ interface AgentInvocationParams {
   thinking?: string;
   max_turns?: number;
   run_in_background?: boolean;
-  inherit_context?: boolean;
+  inherit_context?: ContextInheritance;
   isolated?: boolean;
   /**
    * Untyped on purpose. Both tool schemas now build this field conditionally
@@ -102,7 +102,7 @@ export function resolveAgentInvocationConfig(
   modelFromParams: boolean;
   thinking?: ThinkingLevel;
   maxTurns?: number;
-  inheritContext: boolean;
+  inheritContext: ContextInheritance;
   runInBackground: boolean;
   isolated: boolean;
   isolation?: IsolationMode;

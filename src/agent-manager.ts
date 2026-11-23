@@ -22,7 +22,7 @@ import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-wor
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentInvocation, AgentRecord, AgentTombstone, ContextInheritance, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
@@ -196,7 +196,7 @@ interface SpawnOptions {
   model?: Model<any>;
   maxTurns?: number;
   isolated?: boolean;
-  inheritContext?: boolean;
+  inheritContext?: ContextInheritance;
   thinkingLevel?: ThinkingLevel;
   isBackground?: boolean;
   /**
@@ -273,6 +273,8 @@ interface SpawnOptions {
    * silently never fire (or fire into an unrelated caller's closure).
    */
   onSpawned?: (id: string) => void;
+  /** Trusted in-process ownership registration, before queue/start/terminal events. */
+  onAllocated?: (id: string) => void;
   /**
    * Called synchronously when the spawn is queued instead of started, with how
    * many entries in its own pool are ahead of it. The foreground UI uses it to
@@ -543,6 +545,13 @@ export class AgentManager {
       rootSessionId: options.rootSessionId,
     };
     this.agents.set(id, record);
+    // A throwing owner refuses this spawn before it can queue or execute.
+    try {
+      options.onAllocated?.(id);
+    } catch (err) {
+      this.agents.delete(id);
+      throw err;
+    }
     // After the insert, so `takenHandles()` already counts this record's own
     // handle — a spawn named after its own type gets `explore-2`, not a
     // duplicate `explore` that would make resolution ambiguous.
@@ -624,7 +633,7 @@ export class AgentManager {
       () => { this.startups.delete(id); },
       (err) => {
         this.startups.delete(id);
-        if (queuedPool !== undefined) {
+        if (queuedPool !== undefined || args.options.onAllocated) {
           // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
@@ -785,6 +794,7 @@ export class AgentManager {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
+      onContextSnapshot: (snapshot) => { record.contextSnapshot = snapshot; },
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
       onAssistantUsage: (usage) => {

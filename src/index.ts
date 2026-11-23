@@ -147,6 +147,14 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
   return { state, callbacks };
 }
 
+/** Keep the native activity owner while honoring trusted in-process observers. */
+function trackedCallback<T extends unknown[]>(tracker: (...args: T) => void, observer?: (...args: T) => void) {
+  return (...args: T) => {
+    tracker(...args);
+    observer?.(...args);
+  };
+}
+
 /**
  * Advertised thinking levels, ordered to mirror pi-ai's EXTENDED_THINKING_LEVELS
  * (`off` + every `ThinkingLevel`). Single source for the Agent tool description,
@@ -561,6 +569,7 @@ export default function (pi: ExtensionAPI) {
       durationMs,
       tokens,
       usage,
+      ...(record.contextSnapshot ? { contextSnapshot: record.contextSnapshot } : {}),
     };
   }
 
@@ -586,6 +595,7 @@ export default function (pi: ExtensionAPI) {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
+      ...(record.contextSnapshot ? { contextSnapshot: record.contextSnapshot } : {}),
     });
 
     // Skip notification if result was already consumed via get_subagent_result
@@ -679,8 +689,8 @@ export default function (pi: ExtensionAPI) {
     // and no turn count, so the row reads `thinking…` for the agent's whole life
     // while the header's tool-use count climbs beside it (#181). Double-tracking
     // is not possible: the Agent tool calls `manager.spawn` directly. The tracker
-    // callbacks are the funnel's own — a caller's are not honoured, since a
-    // half-wired tracker renders worse than none.
+    // callbacks remain installed even when a trusted caller observes activity
+    // or binds the real child session for owned result handling.
     //
     // The turn limit is resolved rather than read off `options`, which a mention
     // spawn deliberately omits so the agent's own config can decide: a tracker
@@ -690,13 +700,32 @@ export default function (pi: ExtensionAPI) {
     const { state, callbacks } = createActivityTracker(resolveEffectiveMaxTurns(dispatch.type, options?.maxTurns));
     // Repaints are left to the manager's `onStart` callback, which already starts
     // the widget/fleet timers for agents that enter this way.
-    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, { ...options, ...callbacks });
-    agentActivity.set(id, state);
+    const owned = typeof options?.onAllocated === "function";
+    const id = manager.spawn(piRef, ctxRef, dispatch.type, prompt, {
+      ...options,
+      ...(owned ? { onAllocated: (allocatedId: string) => {
+        agentActivity.set(allocatedId, state);
+        try { options.onAllocated(allocatedId); }
+        catch (err) { agentActivity.delete(allocatedId); throw err; }
+      } } : {}),
+      onToolActivity: trackedCallback(callbacks.onToolActivity, options?.onToolActivity),
+      onTextDelta: trackedCallback(callbacks.onTextDelta, options?.onTextDelta),
+      onTurnEnd: trackedCallback(callbacks.onTurnEnd, options?.onTurnEnd),
+      onSessionCreated: trackedCallback(callbacks.onSessionCreated, options?.onSessionCreated),
+      onAssistantUsage: trackedCallback(callbacks.onAssistantUsage, options?.onAssistantUsage),
+    });
+    if (!owned) agentActivity.set(id, state);
     return id;
   };
 
   const spawnTopLevel = (piRef: any, ctxRef: any, type: string, prompt: string, options: any) => {
     const safeOptions = { ...(options ?? {}) };
+    // Functions are native-only capabilities, never JSON/model arguments.
+    for (const key of ["onAllocated", "onSessionCreated", "onToolActivity", "onTextDelta", "onTurnEnd", "onAssistantUsage"]) {
+      if (safeOptions[key] !== undefined && typeof safeOptions[key] !== "function") {
+        throw new Error(`SpawnOptions.${key} must be an in-process function`);
+      }
+    }
     delete safeOptions.parentAgentId;
     // Internal too: a forged value would hide an RPC-spawned agent inside
     // someone else's workflow, and take it out of the concurrency pool with it.
@@ -1099,6 +1128,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
+    rpcHandle?.unsubCapabilities();
     rpcHandle?.unsubConsume();
     rpcHandle?.unsubSteer();
     rpcHandle = undefined;
@@ -1640,8 +1670,8 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
       inherit_context: Type.Optional(
-        Type.Boolean({
-          description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
+        Type.Union([Type.Boolean(), Type.Literal("compacted")], {
+          description: 'false: fresh context (default). true: legacy rendered history. "compacted": bounded native Pi context, captured at actual start.',
         }),
       ),
       ...isolationParam(isWorktreeIsolationEnabled()),
@@ -3298,7 +3328,7 @@ prompt_mode: <"replace" (body IS the full system prompt) or "append" (body is ap
 extensions: <true (inherit all MCP/extension tools), false (none), or comma-separated names. Default: true>
 skills: <true (inherit all), false (none), or comma-separated skill names to preload into prompt. Default: true>
 disallowed_tools: <comma-separated tool names to block, even if otherwise available. Omit for none>
-inherit_context: <true to fork parent conversation into agent so it sees chat history. Default: false>
+inherit_context: <false (fresh), true (rendered history), or compacted (bounded native Pi context at actual start). Default: false>
 run_in_background: <pin this agent to background (true) or foreground (false). Omit to follow the backgroundByDefault setting, which is background>
 output_transcript: <false to write no transcript file or path for this agent. Independent of persist_session. Default: true>
 isolated: <true for no extension/MCP tools, only built-in tools. Default: false>

@@ -141,6 +141,14 @@ You are a security auditor.`);
     expect(agent.systemPrompt).toBe("You are a security auditor.");
   });
 
+  it("preserves compacted inheritance through frontmatter and eject", () => {
+    writeAgent("compacted", "---\ninherit_context: compacted\n---\nContext reader.");
+    const config = loadCustomAgents(tmpDir).get("compacted")!;
+    expect(config.inheritContext).toBe("compacted");
+    writeAgent("roundtrip", serializeAgentFile(config));
+    expect(loadCustomAgents(tmpDir).get("roundtrip")!.inheritContext).toBe("compacted");
+  });
+
   it("uses sensible defaults when frontmatter is empty", () => {
     writeAgent("minimal", `---
 ---

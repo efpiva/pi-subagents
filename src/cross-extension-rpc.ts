@@ -14,6 +14,7 @@
  */
 
 import { isTopLevelAgent } from "./agent-manager.js";
+import { getForkBuildId } from "./build-identity.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import type { AgentRecord } from "./types.js";
@@ -66,6 +67,7 @@ export interface RpcDeps {
 
 export interface RpcHandle {
   unsubPing: () => void;
+  unsubCapabilities: () => void;
   unsubSpawn: () => void;
   unsubStop: () => void;
   unsubConsume: () => void;
@@ -105,6 +107,18 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
 
   const unsubPing = handleRpc(events, "subagents:rpc:ping", () => {
     return { version: PROTOCOL_VERSION };
+  });
+
+  let buildId: string | undefined;
+  try { buildId = getForkBuildId(); } catch { /* capability refuses; legacy RPC stays available */ }
+  const unsubCapabilities = handleRpc(events, "subagents:rpc:capabilities", () => {
+    if (!getCtx()) throw new Error("No active session");
+    if (!buildId) throw new Error("Build identity unavailable");
+    return {
+      version: 1,
+      features: { compactedContextV1: true, ownedLifecycleV1: true, synchronousConsumeV1: true },
+      buildId,
+    };
   });
 
   const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: any }>(
@@ -216,5 +230,5 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     },
   );
 
-  return { unsubPing, unsubSpawn, unsubStop, unsubConsume, unsubSteer };
+  return { unsubPing, unsubCapabilities, unsubSpawn, unsubStop, unsubConsume, unsubSteer };
 }
