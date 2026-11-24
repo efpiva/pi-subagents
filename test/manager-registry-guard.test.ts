@@ -19,6 +19,7 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import { runAgent } from "../src/agent-runner.js";
+import { inChildSessionContext, runInChildSessionContext } from "../src/child-context.js";
 import subagentsExtension from "../src/index.js";
 
 const MANAGER_KEY = Symbol.for("pi-subagents:manager");
@@ -79,6 +80,49 @@ afterEach(() => {
 });
 
 describe("Symbol.for manager registry across activations", () => {
+  it("exposes the existing child context query without activating a recursive manager", async () => {
+    delete (globalThis as Record<symbol, unknown>)[MANAGER_KEY];
+    const root = makePi();
+    const child = makePi();
+    const concurrentParent = makePi();
+    subagentsExtension(root.pi);
+    const entry = (globalThis as Record<symbol, { inChildSessionContext(): boolean }>)[MANAGER_KEY];
+    let releaseChild!: () => void;
+    const paused = new Promise<void>(resolve => { releaseChild = resolve; });
+    let childLoad: Promise<void> | undefined;
+
+    try {
+      expect(entry.inChildSessionContext).toBe(inChildSessionContext);
+      expect(entry.inChildSessionContext()).toBe(false);
+      childLoad = runInChildSessionContext(async () => {
+        // The same scope used for child resource factories in agent-runner.
+        subagentsExtension(child.pi);
+        expect(entry.inChildSessionContext()).toBe(true);
+        expect(child.pi.on).not.toHaveBeenCalled();
+        expect(child.pi.registerTool).not.toHaveBeenCalled();
+        expect(child.pi.events.emit).not.toHaveBeenCalled();
+        await paused;
+        expect(entry.inChildSessionContext()).toBe(true);
+      });
+
+      // Parent factories can still load while the child async branch is open.
+      expect(entry.inChildSessionContext()).toBe(false);
+      subagentsExtension(concurrentParent.pi);
+      expect(concurrentParent.tools.has("Agent")).toBe(true);
+      expect((globalThis as Record<symbol, unknown>)[MANAGER_KEY]).toBe(entry);
+      releaseChild();
+      await childLoad;
+      expect(entry.inChildSessionContext()).toBe(false);
+    } finally {
+      releaseChild();
+      await Promise.all([
+        childLoad,
+        concurrentParent.lifecycle.get("session_shutdown")?.(),
+        root.lifecycle.get("session_shutdown")?.(),
+      ]);
+    }
+  });
+
   it("child activation does not overwrite the root entry; child shutdown does not delete it", async () => {
     delete (globalThis as any)[MANAGER_KEY];
 

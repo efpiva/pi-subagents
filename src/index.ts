@@ -765,6 +765,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const registryEntry = {
+    inChildSessionContext,
     waitForAll: () => manager.waitForAll(),
     hasRunning: () => manager.hasRunning(),
     spawn: spawnTopLevel,

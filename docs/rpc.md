@@ -147,12 +147,15 @@ It takes an id only, enforces the same top-level ownership guard as stop, and an
 |---|---|---|
 | `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
 | `hasRunning()` | `() => boolean` | |
+| `inChildSessionContext()` | `() => boolean` | Passive, synchronous query of the existing child resource-loading/session-construction async context; not readiness or permission |
 | `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
 | `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |
 
 The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone, and shutdown releases it only if this activation claimed it (`src/index.ts:747-750`, `:1105-1107`).
 
-Prefer the bus. The registry has no reply envelope, no version, and no availability event — `globalThis[Symbol.for("pi-subagents:manager")] === undefined` is the only probe you get, and it is also `undefined` in a session that filtered pi-subagents out. Reach for it for the two things the bus has no verb for — *is anything still running*, and *give me a settled record back* — or for a headless host that wants to block on `waitForAll()` before exiting.
+Call `inChildSessionContext()` from an extension factory to detect child loading before waiting for a child-local `subagents:ready` that will never fire. It exposes the same AsyncLocalStorage query used to suppress recursive manager activation: true in that child async context, false outside it, including concurrent parent loading. It does not activate a manager, emit events, grant authority, or report session readiness. Query it in the current async context rather than caching the result as process-wide state. If the registry or method is absent, child context is unknown, not proven false.
+
+Prefer the bus for operations it supports. The registry has no reply envelope, no version, and no availability event — `globalThis[Symbol.for("pi-subagents:manager")] === undefined` is the only probe you get, and it is also `undefined` in a session that filtered pi-subagents out. Reach for it to query child loading, ask *is anything still running*, or *give me a settled record back*, or for a headless host that wants to block on `waitForAll()` before exiting.
 
 ## Compacted context
 
@@ -202,6 +205,7 @@ This document has no test of its own, so it is worth knowing which claims are ac
 |---|---|---|
 | `test/cross-extension-rpc.test.ts` | Mocked `SpawnCapable` | Envelope shape, per-channel error strings (including steer's), model resolution and scope enforcement |
 | `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
+| `test/manager-registry-guard.test.ts` | Real extension factory | Registry exposes the existing ALS query, child activation stays suppressed, and concurrent parent loading stays outside the child context |
 | `test/rpc-result-consumption.test.ts` | Real delivery path | The notification firing, and not firing, around `consume` |
 
 Not pinned anywhere, so treat them as descriptions rather than contracts: the `SpawnOptions.cwd` error strings, `subagents:ready`'s `{}` payload, consume's handle resolution, and its missing `workflowId` check.
